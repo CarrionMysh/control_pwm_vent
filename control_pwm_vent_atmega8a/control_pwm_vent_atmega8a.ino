@@ -31,7 +31,7 @@
 #define pin_atmegaSerial_tx 7  //пин для софтового порта tx
 //остальные константы
 #define wait 0             //задержка для срабатывания прерывания на atmega8a
-#define tau2  500          //переменная времени для периода. равняется tau на атмеге8а минус примерное время основных операций (считывание температуры, передача rpm). разность с tau_атмеги есть "глухота" кнопки энкодера.
+#define tau2  500          //переменная времени для периода. равняется tau на атмеге8а минус примерное время основных операций (считывание температуры, передача rpm). разность с tau_атмеги есть "глухота" кнопки/энкодера.
 #define tau_atmega8a    1000
 #define temp_resolut    10   //точность измерения температуры 9..12
 #define addr_pwm_min1   1
@@ -81,6 +81,9 @@ boolean sw_flag = false;                                          //флаг sw 
 float t_alarm1 = 30;                                              //пороговое значение температуры радиатора проца
 float t_alarm2 = 50;                                              //пороговое значение температуры радиатора на материнской плате
 float t_alarm3 = 50;                                              //пороговое значение температуры радиатора БП
+float t_maxTemp1 = 40;                                               //верхняя предельная температура проца
+float t_maxTemp2 = 60;                                               //верхняя предельная температура материнской платы
+float t_maxTemp3 = 55;                                               //верхняя предельная температура БП
 boolean alarm1 = 0, alarm2 = 0, alarm3 = 0;                       //алярмы превышения порога температуры, при включении сброшены в ноль
 byte ch   ;                                                       //переменная для SoftSerial
 byte count = 0;                                                   //счетчик пакетов
@@ -92,7 +95,7 @@ int rpm_max1 = 0, rpm_max2 = 0, rpm_max3 = 0, rpm_min1 = 0, rpm_min2 = 0, rpm_mi
 boolean vent1, vent2, vent3;                                      //флаги наличия вентов
 float rpm_s1[10], rpm_tt1, rpm_s2[10], rpm_tt2, rpm_s3[10], rpm_tt3; //массив значений реальных оборотов, переменная средней скользящей
 int n = 0;                                                        //переменная для перебора массивов rpm
-byte nn = 1;                                                      // 0..х коэфициент сглаживания скользящей средней (до10 - ограничено массивом)
+byte nn = 0;                                                      // 0..х коэфициент сглаживания скользящей средней (до10 - ограничено массивом)
 boolean zero_data1 = true, zero_data2 = true, zero_data3 = true;  //флаг первых данных или после остановки вентов
 boolean flag_loop_tau = true;                                     //флаг цикла по времени.
 float t_post_alarm = 2;                                           //сколько градусов нужно держать обороты посталярмы
@@ -329,14 +332,14 @@ void calib_vent() {                                                   //кали
   fake_rpm2 = false;
   fake_rpm3 = false;
 
-  int cc_step = 2;                                                    //шаг pwm в цикле калибровки. для дебага =2(быстрее). в релизе лучше 1
+  int cc_step = 1;                                                    //шаг pwm в цикле калибровки. для дебага =2(быстрее). в релизе лучше 1
   lcd.home();
   lcd.clear();
   lcd.print("Testing..");
   analogWrite(pin_pwm_v1, 255);                                       //меряем максимум
   analogWrite(pin_pwm_v2, 255);
   analogWrite(pin_pwm_v3, 255);
-  delay(view_time * 2);                                                 //даем время на раскрутку вентов
+  delay(view_time * 3);                                                 //даем время на раскрутку вентов
   read_rpm();
   rpm_max1 = rpm1;
   rpm_max2 = rpm2;
@@ -371,6 +374,7 @@ void calib_vent() {                                                   //кали
 
       drpm1_old = drpm1;                                             //запоминаем предыдущую дельту оборотов
       drpm1 = rpm1_old - rpm1;                                       //дельта rpm, при девиации составит 1(*60)
+      Serial.print("drpm1_old="); Serial.print(drpm1_old); Serial.print(" drpm1="); Serial.println(drpm1);
       if ((drpm1 > drpm1_old) && !flag_rpm1_up) {                    //девиации оборотов составляют постоянное значение(?) +-1(*60), при дельте оборотов больше этого значения, предполагаем начало устойчивого снижения - началась реакция вента на изменение pwm
         flag_rpm1_up = true;
         pwm1_up = i;
@@ -401,8 +405,7 @@ void calib_vent() {                                                   //кали
         pwm3_up = i;
       }
     }
-    //   Serial.println();
-    //  Serial.print("flag_rpm1_up="); Serial.print(flag_rpm1_up); Serial.print( "flag_rpm11_up="); Serial.print(flag_rpm11_up);
+
     Serial.print(" pwm1_up="); Serial.print(pwm1_up); Serial.print(" pwm2_up="); Serial.print(pwm2_up); Serial.print(" pwm3_up="); Serial.println(pwm3_up);
     if (rpm1 == 0 && !fault_rotation1) {
       pwm_stop1 = i;
@@ -531,30 +534,23 @@ void calib_vent() {                                                   //кали
   EEPROM.update(addr_pwm3_up, pwm3_up);
 }
 
-void call_temp_controll() {
+void call_temp_controll() {           //обработчик превышения температуры. внутри превышения температуры оперируем pwm_a
+  int r_pwm1;                         //рабочий динамический диапазон pwm
+  float dr_temp1;                     //шаг rpm/град
+  float tr_alarm1;                    //диапазон температуры алярмы
+  r_pwm1 = pwm1_up - pwm1;
+  tr_alarm1 = t_maxTemp1 - t_alarm1;
+  dr_temp1 = r_pwm1 / tr_alarm1;
 
-  //реакция на превышение температуры. временной интервал прироста pwm - tau atmega8a
+
   //проц
   if (t_probe1 > t_alarm1) {          //видим превышение
-    if (!alarm1) {                    //при первом входе за инцидент
-      alarm1 = true;                  //алярма!!
-      Serial.println("alarm1!!");
-      pwm1_a = pwm1;                  //при выходе вверх за порог, отталкиваемся от текущего значения ШИМ
-    }
-    //    dtt1 = t_probe1 - t_pred1;        //считаем дельту (текущая-предыдущая температура)
-    //    if (dtt1 > 0) pwm1_a += step_alarm;        //увеличиваем аварийное значение ШИМ на (аварийный шаг)
-    pwm1_a += step_alarm;
-    if (pwm1_a > 255) pwm1_a = 255;
-    Serial.println(pwm1_a);
+    pwm1_a = (t_probe1 - t_alarm1) * dr_temp1 + pwm1;         //привязка к температуре.
+    if (pwm1_a > 255) pwm1_a = 255;     //от переполнения pwm
     analogWrite(pin_pwm_v1, pwm1_a);
-  } else {                            //температура ниже пороговой, ниже в коде проверяем была ли алярма
-    if (alarm1) {                     //алярма была, и:
-      if ((t_probe1 + t_post_alarm) < t_alarm1) { //и: ниже пороговой на t_post_alarm выход за порог вниз, возвращаем запомненное значение оборотов, отбой тревоги. иначе будет крутиться последние значение rpm, при которых пошло снижение t
-        alarm1 = false;
-        analogWrite(pin_pwm_v1, pwm1);
-      } else analogWrite(pin_pwm_v1, pwm1_a);     //если ниже пороговой, но в районе t_post_alarm, то продолжаем крутиться на последнем аварийном значении rpm.
-    }
-  }                                   //_____
+
+  } else analogWrite(pin_pwm_v1, pwm1);     //если превышения нет, то pwm. строка нужна для возврата к исходному значению pwm до алярмы. (округление int при расчете pwm_a может дать разницу с pwm при выходе за границу алярмы вниз
+  //_____
   //мать
   if (t_probe2 > t_alarm2) {          //видим превышение
     if (!alarm2) {                    //при первом входе за инцидент
